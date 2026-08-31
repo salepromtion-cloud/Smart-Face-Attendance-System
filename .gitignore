@@ -1,25 +1,17 @@
-﻿# Python
+﻿.venv/
 __pycache__/
-*.py[cod]
-*.pyo
+*.pyc
 
-# Virtual environment
-.venv/
-
-# Employee and attendance data
 data/*.xlsx
 data/*.xls
-data/*.pkl
+data/*.csv
 
-# Anti-spoofing model files
-models/silent_face_anti_spoofing/
+faces/
+face_data/
+face_embeddings/
+captures/
+logs/
+backups/
 
-# Local secrets
+*.log
 .env
-
-# VS Code
-.vscode/
-
-# OS files
-Thumbs.db
-Desktop.ini
