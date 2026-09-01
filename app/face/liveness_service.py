@@ -1,304 +1,343 @@
 import cv2
 import numpy as np
-from typing import Tuple, Dict, List, Optional
-import mediapipe as mp
+import onnxruntime as ort
 from dataclasses import dataclass
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Tuple
+
+
+class LivenessServiceError(Exception):
+    """Raised when liveness inference cannot be initialized or executed safely."""
 
 
 @dataclass
 class LivenessResult:
-    """Result of liveness detection"""
-    is_alive: bool
-    confidence: float
-    details: Dict[str, any]
+    is_live: bool
+    live_score: Optional[float]
+    scores: List[float]
+    probabilities: Optional[List[float]]
+    details: Dict[str, Any]
 
 
 class LivenessService:
+    """MiniFASNetV2 anti-spoofing inference layer.
+
+    This service accepts an already-cropped face image and performs ONNX Runtime
+    inference against the verified MiniFASNetV2 model. It intentionally does NOT
+    handle camera access, face detection, identity recognition, or attendance
+    workflow logic.
+
+    The exact ONNX artifact does not include class labels. The output is a raw
+    3-class score/logit vector. The semantic index corresponding to "live" is not
+    encoded in the model and therefore remains configuration-dependent. Until a
+    verified live_class_index and threshold are supplied by the caller, this
+    service remains fail-closed and returns is_live=False.
     """
-    Service for detecting face liveness to prevent spoofing attacks.
-    Uses multiple techniques including eye blinking, head movement, and texture analysis.
-    """
-    
-    def __init__(self, blink_threshold: float = 0.2, movement_threshold: float = 5.0):
-        """
-        Initialize liveness service with MediaPipe Face Mesh
-        
-        Args:
-            blink_threshold: Eye aspect ratio threshold for blink detection
-            movement_threshold: Minimum head movement in pixels to detect
-        """
-        self.mp_face_mesh = mp.solutions.face_mesh
-        self.face_mesh = self.mp_face_mesh.FaceMesh(
-            static_image_mode=False,
-            max_num_faces=1,
-            refine_landmarks=True,
-            min_detection_confidence=0.5,
-            min_tracking_confidence=0.5
-        )
-        self.blink_threshold = blink_threshold
-        self.movement_threshold = movement_threshold
-        
-        # Eye landmark indices for MediaPipe Face Mesh
-        self.LEFT_EYE_INDICES = [362, 382, 381, 380, 374, 373, 390, 249, 263, 466, 388, 387, 386, 385, 384, 398]
-        self.RIGHT_EYE_INDICES = [33, 7, 163, 144, 145, 153, 154, 155, 133, 173, 157, 158, 159, 160, 161, 246]
-        self.MOUTH_INDICES = [61, 185, 40, 39, 37, 0, 267, 269, 270, 409, 291, 375, 321, 405, 314, 17, 84, 181, 91, 146]
-        self.FACE_CONTOUR_INDICES = [10, 338, 297, 332, 284, 251, 389, 356, 454, 323, 361, 288, 397, 365, 379, 378, 400, 377, 152, 148, 176, 149, 150, 136, 172, 58, 132, 93, 234, 127, 162, 21, 54, 103, 67, 109]
-        
-    def detect_eye_blink(self, frame: np.ndarray) -> Tuple[bool, float]:
-        """
-        Detect eye blink using eye aspect ratio
-        
-        Args:
-            frame: Input video frame
-            
-        Returns:
-            Tuple of (blink_detected, eye_aspect_ratio)
-        """
-        results = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
-        if not results.multi_face_landmarks:
-            return False, 0.0
-        
-        landmarks = results.multi_face_landmarks[0].landmark
-        h, w = frame.shape[:2]
-        
-        # Calculate eye aspect ratio for both eyes
-        left_eye_points = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in self.LEFT_EYE_INDICES])
-        right_eye_points = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in self.RIGHT_EYE_INDICES])
-        
-        left_ear = self._calculate_eye_aspect_ratio(left_eye_points)
-        right_ear = self._calculate_eye_aspect_ratio(right_eye_points)
-        
-        avg_ear = (left_ear + right_ear) / 2.0
-        blink_detected = avg_ear < self.blink_threshold
-        
-        return blink_detected, avg_ear
-    
-    def detect_head_movement(self, frame: np.ndarray, prev_landmarks: Optional[List] = None) -> Tuple[bool, float, List]:
-        """
-        Detect head movement by tracking face landmarks
-        
-        Args:
-            frame: Input video frame
-            prev_landmarks: Previous frame landmarks for comparison
-            
-        Returns:
-            Tuple of (movement_detected, movement_distance, current_landmarks)
-        """
-        results = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
-        if not results.multi_face_landmarks:
-            return False, 0.0, None
-        
-        current_landmarks = results.multi_face_landmarks[0].landmark
-        h, w = frame.shape[:2]
-        
-        if prev_landmarks is None:
-            return False, 0.0, current_landmarks
-        
-        # Calculate movement using nose tip and face center
-        curr_nose = np.array([current_landmarks[1].x * w, current_landmarks[1].y * h])
-        prev_nose = np.array([prev_landmarks[1].x * w, prev_landmarks[1].y * h])
-        
-        movement_distance = np.linalg.norm(curr_nose - prev_nose)
-        movement_detected = movement_distance > self.movement_threshold
-        
-        return movement_detected, movement_distance, current_landmarks
-    
-    def analyze_texture_quality(self, frame: np.ndarray) -> Tuple[bool, float]:
-        """
-        Analyze texture quality to detect printed/spoofed images
-        
-        Args:
-            frame: Input video frame
-            
-        Returns:
-            Tuple of (quality_good, sharpness_score)
-        """
-        # Convert to grayscale
-        gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        
-        # Calculate Laplacian variance (sharpness metric)
-        laplacian_var = cv2.Laplacian(gray, cv2.CV_64F).var()
-        
-        # Extract face region
-        results = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
-        if not results.multi_face_landmarks:
-            return False, laplacian_var
-        
-        landmarks = results.multi_face_landmarks[0].landmark
-        h, w = frame.shape[:2]
-        
-        # Get face bounding box
-        face_points = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in self.FACE_CONTOUR_INDICES])
-        x_min, y_min = face_points.min(axis=0).astype(int)
-        x_max, y_max = face_points.max(axis=0).astype(int)
-        
-        # Ensure bounds are within frame
-        x_min = max(0, x_min)
-        y_min = max(0, y_min)
-        x_max = min(w, x_max)
-        y_max = min(h, y_max)
-        
-        face_region = gray[y_min:y_max, x_min:x_max]
-        
-        if face_region.size == 0:
-            return False, laplacian_var
-        
-        # Calculate local binary patterns for texture analysis
-        face_laplacian_var = cv2.Laplacian(face_region, cv2.CV_64F).var()
-        
-        # Good quality threshold (higher variance = sharper/more texture)
-        quality_good = face_laplacian_var > 100
-        
-        return quality_good, face_laplacian_var
-    
-    def detect_mouth_movement(self, frame: np.ndarray, prev_landmarks: Optional[List] = None) -> Tuple[bool, float]:
-        """
-        Detect mouth movement for liveness verification
-        
-        Args:
-            frame: Input video frame
-            prev_landmarks: Previous frame landmarks
-            
-        Returns:
-            Tuple of (movement_detected, mouth_aspect_ratio)
-        """
-        results = self.face_mesh.process(cv2.cvtColor(frame, cv2.COLOR_BGR2RGB))
-        
-        if not results.multi_face_landmarks:
-            return False, 0.0
-        
-        landmarks = results.multi_face_landmarks[0].landmark
-        h, w = frame.shape[:2]
-        
-        # Get mouth points
-        mouth_points = np.array([[landmarks[i].x * w, landmarks[i].y * h] for i in self.MOUTH_INDICES])
-        
-        # Calculate mouth aspect ratio
-        mouth_height = np.linalg.norm(mouth_points[0] - mouth_points[5])
-        mouth_width = np.linalg.norm(mouth_points[3] - mouth_points[4])
-        
-        if mouth_width == 0:
-            return False, 0.0
-        
-        mouth_aspect_ratio = mouth_height / mouth_width
-        
-        if prev_landmarks is None:
-            return False, mouth_aspect_ratio
-        
-        # Compare with previous mouth aspect ratio
-        prev_mouth_points = np.array([[prev_landmarks[i].x * w, prev_landmarks[i].y * h] for i in self.MOUTH_INDICES])
-        prev_mouth_height = np.linalg.norm(prev_mouth_points[0] - prev_mouth_points[5])
-        prev_mouth_width = np.linalg.norm(prev_mouth_points[3] - prev_mouth_points[4])
-        
-        if prev_mouth_width == 0:
-            return False, mouth_aspect_ratio
-        
-        prev_mouth_aspect_ratio = prev_mouth_height / prev_mouth_width
-        movement_detected = abs(mouth_aspect_ratio - prev_mouth_aspect_ratio) > 0.1
-        
-        return movement_detected, mouth_aspect_ratio
-    
-    def verify_liveness(self, frames: List[np.ndarray]) -> LivenessResult:
-        """
-        Verify liveness using multiple techniques on a sequence of frames
-        
-        Args:
-            frames: List of video frames
-            
-        Returns:
-            LivenessResult with is_alive flag and confidence score
-        """
-        if not frames or len(frames) < 2:
-            return LivenessResult(is_alive=False, confidence=0.0, details={"error": "Insufficient frames"})
-        
-        blink_count = 0
-        head_movement_detected = False
-        mouth_movement_detected = False
-        quality_scores = []
-        prev_landmarks = None
-        
-        details = {
-            "blink_count": 0,
-            "head_movement": False,
-            "mouth_movement": False,
-            "avg_texture_quality": 0.0,
-            "total_frames_processed": len(frames)
+
+    def __init__(
+        self,
+        model_path: Optional[str] = None,
+        live_class_index: Optional[int] = None,
+        threshold: Optional[float] = None,
+        providers: Optional[List[str]] = None,
+    ) -> None:
+        project_root = Path(__file__).resolve().parents[2]
+        default_model_path = project_root / "models" / "minifasnet_v2.onnx"
+
+        self.model_path = Path(model_path) if model_path else default_model_path
+        self.live_class_index = live_class_index
+        self.threshold = float(threshold) if threshold is not None else None
+        self.providers = providers or ["CPUExecutionProvider"]
+
+        self.session: Optional[ort.InferenceSession] = None
+        self.model_metadata: Dict[str, Any] = {}
+
+        self.input_name: Optional[str] = None
+        self.input_shape: Optional[Tuple[Any, ...]] = None
+        self.input_type: Optional[str] = None
+        self.output_name: Optional[str] = None
+        self.output_shape: Optional[Tuple[Any, ...]] = None
+        self.output_type: Optional[str] = None
+
+        self.expected_channels: Optional[int] = None
+        self.expected_height: Optional[int] = None
+        self.expected_width: Optional[int] = None
+
+        self._initialize_session()
+
+    def _initialize_session(self) -> None:
+        if not self.model_path.exists():
+            raise LivenessServiceError(f"Model file not found: {self.model_path}")
+
+        try:
+            self.session = ort.InferenceSession(str(self.model_path), providers=self.providers)
+        except Exception as exc:  # pragma: no cover - runtime environment only
+            raise LivenessServiceError(f"Unable to create ONNX Runtime session: {exc}") from exc
+
+        inputs = self.session.get_inputs()
+        outputs = self.session.get_outputs()
+
+        if not inputs:
+            raise LivenessServiceError("Model has no input tensor(s).")
+        if not outputs:
+            raise LivenessServiceError("Model has no output tensor(s).")
+
+        input_meta = inputs[0]
+        output_meta = outputs[0]
+
+        self.input_name = input_meta.name
+        self.input_shape = tuple(input_meta.shape)
+        self.input_type = input_meta.type
+        self.output_name = output_meta.name
+        self.output_shape = tuple(output_meta.shape)
+        self.output_type = output_meta.type
+
+        self.expected_channels = self._extract_dimension(self.input_shape, 1, default=None)
+        self.expected_height = self._extract_dimension(self.input_shape, 2, default=None)
+        self.expected_width = self._extract_dimension(self.input_shape, 3, default=None)
+
+        if self.expected_channels is None:
+            # ONNX symbolic batch/sequence dimensions may appear as 'batch' for N,
+            # while C/H/W are numeric in the verified model. If a non-numeric value
+            # appears in the channel position, fail safely instead of guessing.
+            raise LivenessServiceError(
+                f"Model metadata did not expose a valid channel dimension: {self.input_shape}."
+            )
+
+        if self.expected_height is None or self.expected_width is None:
+            raise LivenessServiceError(
+                "Model metadata did not expose valid spatial dimensions for the input. "
+                f"Actual input shape: {self.input_shape}."
+            )
+
+        self._validate_model_interface()
+
+        meta = self.session.get_modelmeta()
+        self.model_metadata = {
+            "name": getattr(meta, "name", None),
+            "producer_name": getattr(meta, "producer_name", None),
+            "graph_name": getattr(meta, "graph_name", None),
+            "domain": getattr(meta, "domain", None),
+            "version": getattr(meta, "version", None),
+            "custom_metadata_map": getattr(meta, "custom_metadata_map", None) or {},
         }
-        
-        for i, frame in enumerate(frames):
-            # Detect blink
-            blink, ear = self.detect_eye_blink(frame)
-            if blink:
-                blink_count += 1
-            
-            # Detect head movement
-            h_move, h_dist, curr_landmarks = self.detect_head_movement(frame, prev_landmarks)
-            if h_move:
-                head_movement_detected = True
-            
-            # Analyze texture quality
-            quality, texture_score = self.analyze_texture_quality(frame)
-            quality_scores.append(texture_score)
-            
-            # Detect mouth movement
-            m_move, mar = self.detect_mouth_movement(frame, prev_landmarks)
-            if m_move:
-                mouth_movement_detected = True
-            
-            prev_landmarks = curr_landmarks
-        
-        # Calculate liveness score
-        details["blink_count"] = blink_count
-        details["head_movement"] = head_movement_detected
-        details["mouth_movement"] = mouth_movement_detected
-        details["avg_texture_quality"] = np.mean(quality_scores) if quality_scores else 0.0
-        
-        # Determine liveness based on criteria
-        liveness_indicators = [
-            blink_count >= 1,
-            head_movement_detected,
-            mouth_movement_detected,
-            details["avg_texture_quality"] > 100
-        ]
-        
-        # Require at least 2 indicators for positive liveness detection
-        positive_indicators = sum(liveness_indicators)
-        confidence = positive_indicators / len(liveness_indicators)
-        is_alive = positive_indicators >= 2
-        
-        return LivenessResult(
-            is_alive=is_alive,
-            confidence=confidence,
-            details=details
-        )
-    
+
+    def _validate_model_interface(self) -> None:
+        if self.input_name != "input":
+            raise LivenessServiceError(
+                f"Unexpected ONNX input name: {self.input_name}. Expected 'input'."
+            )
+
+        if self.output_name != "output":
+            raise LivenessServiceError(
+                f"Unexpected ONNX output name: {self.output_name}. Expected 'output'."
+            )
+
+        if self.input_shape is None or len(self.input_shape) != 4:
+            raise LivenessServiceError(
+                f"Unexpected ONNX input shape: {self.input_shape}. Expected 4D [N, C, H, W]."
+            )
+
+        if self.output_shape is None or len(self.output_shape) != 2:
+            raise LivenessServiceError(
+                f"Unexpected ONNX output shape: {self.output_shape}. Expected 2D [N, 3]."
+            )
+
+        if self.expected_channels != 3:
+            raise LivenessServiceError(
+                "MiniFASNetV2 expected 3 input channels. Actual value: "
+                f"{self.expected_channels}."
+            )
+
+        if self.input_type != "tensor(float)":
+            raise LivenessServiceError(
+                f"Unexpected ONNX input type: {self.input_type}. Expected 'tensor(float)'."
+            )
+
+        if self.output_type != "tensor(float)":
+            raise LivenessServiceError(
+                f"Unexpected ONNX output type: {self.output_type}. Expected 'tensor(float)'."
+            )
+
+        if self.output_shape[-1] != 3:
+            raise LivenessServiceError(
+                "MiniFASNetV2 output must be 3 raw scores/logits. Actual output shape: "
+                f"{self.output_shape}."
+            )
+
     @staticmethod
-    def _calculate_eye_aspect_ratio(eye_points: np.ndarray) -> float:
-        """
-        Calculate eye aspect ratio (EAR) for blink detection
-        
-        Args:
-            eye_points: Array of eye landmark points
-            
-        Returns:
-            Eye aspect ratio value
-        """
-        if len(eye_points) < 6:
-            return 0.0
-        
-        # Calculate distances
-        A = np.linalg.norm(eye_points[1] - eye_points[5])
-        B = np.linalg.norm(eye_points[2] - eye_points[4])
-        C = np.linalg.norm(eye_points[0] - eye_points[3])
-        
-        # Calculate aspect ratio
-        ear = (A + B) / (2.0 * C + 1e-6)
-        return ear
-    
-    def release(self):
-        """Release resources"""
-        if self.face_mesh:
-            self.face_mesh.close()
+    def _extract_dimension(shape: Optional[Tuple[Any, ...]], index: int, default: Optional[int] = None) -> Optional[int]:
+        if not shape or len(shape) <= index:
+            return default
+        value = shape[index]
+        return int(value) if isinstance(value, (int, np.integer)) else default
+
+    def _preprocess_face_image(self, face_image: np.ndarray) -> np.ndarray:
+        self._validate_face_image(face_image)
+
+        target_height = int(self.expected_height)
+        target_width = int(self.expected_width)
+
+        # OpenCV uses BGR. The verified model metadata is [N, 3, H, W] and uses
+        # RGB order for image input pipelines. This conversion is explicit.
+        rgb_image = cv2.cvtColor(face_image, cv2.COLOR_BGR2RGB)
+        rgb_image = cv2.resize(rgb_image, (target_width, target_height), interpolation=cv2.INTER_LINEAR)
+
+        rgb_image = rgb_image.astype(np.float32, copy=False)
+        rgb_image = rgb_image / 255.0
+
+        chw = np.transpose(rgb_image, (2, 0, 1))
+        batch = np.expand_dims(chw, axis=0)
+        return batch.astype(np.float32, copy=False)
+
+    @staticmethod
+    def _validate_face_image(face_image: np.ndarray) -> None:
+        if not isinstance(face_image, np.ndarray):
+            raise LivenessServiceError("face_image must be a numpy.ndarray.")
+        if face_image.size == 0:
+            raise LivenessServiceError("face_image is empty.")
+        if face_image.ndim != 3:
+            raise LivenessServiceError("face_image must have shape (H, W, C).")
+        if face_image.shape[2] != 3:
+            raise LivenessServiceError("face_image must have exactly 3 channels.")
+        if not np.isfinite(face_image).all():
+            raise LivenessServiceError("face_image contains invalid non-finite pixel values.")
+
+    @staticmethod
+    def _softmax(scores: List[float]) -> List[float]:
+        if not scores:
+            return []
+        values = np.asarray(scores, dtype=np.float64)
+        shifted = values - np.max(values)
+        exp_values = np.exp(shifted)
+        total = np.sum(exp_values)
+        if total == 0.0:
+            return [0.0 for _ in scores]
+        return [float(v) for v in exp_values / total]
+
+    def _run_inference(self, face_image: np.ndarray) -> Dict[str, Any]:
+        if self.session is None:
+            raise LivenessServiceError("ONNX Runtime session is not initialized.")
+
+        input_tensor = self._preprocess_face_image(face_image)
+        input_feed = {self.input_name: input_tensor}
+        raw_output = self.session.run([self.output_name], input_feed)[0]
+
+        if raw_output is None:
+            raise LivenessServiceError("Model returned no output.")
+
+        output_array = np.asarray(raw_output)
+        if output_array.ndim == 0:
+            scores = [float(output_array)]
+        else:
+            scores = [float(value) for value in output_array.reshape(-1).tolist()]
+
+        if len(scores) != 3:
+            raise LivenessServiceError(
+                f"Unexpected raw score count: {len(scores)}. Expected 3 scores/logits."
+            )
+
+        probabilities = self._softmax(scores)
+
+        details: Dict[str, Any] = {
+            "model_path": str(self.model_path),
+            "input_name": self.input_name,
+            "input_shape": list(self.input_shape) if self.input_shape else None,
+            "input_type": self.input_type,
+            "output_name": self.output_name,
+            "output_shape": list(self.output_shape) if self.output_shape else None,
+            "output_type": self.output_type,
+            "preprocessed_shape": list(input_tensor.shape),
+            "channel_conversion": "BGR -> RGB",
+            "expected_input_channels": self.expected_channels,
+            "expected_input_height": self.expected_height,
+            "expected_input_width": self.expected_width,
+            "raw_scores": scores,
+            "softmax_probabilities": probabilities,
+            "configured_live_class_index": self.live_class_index,
+            "configured_threshold": self.threshold,
+            "class_mapping_known": self.live_class_index is not None and self.threshold is not None,
+            "class_order_unknown": True,
+            "class_order_evidence": (
+                "The exact ONNX artifact exposes three raw output scores with shape [batch, 3], "
+                "but it contains no class names, labels, or metadata that define which index represents live. "
+                "This class mapping must be supplied separately and verified by the original model source or documentation."
+            ),
+        }
+
+        return {"scores": scores, "probabilities": probabilities, "details": details}
+
+    def check_liveness(self, face_image: np.ndarray) -> LivenessResult:
+        try:
+            inference = self._run_inference(face_image)
+            scores = inference["scores"]
+            probabilities = inference["probabilities"]
+            details = inference["details"]
+
+            if self.live_class_index is None:
+                details["fail_closed_reason"] = (
+                    "live_class_index is not configured. The model exposes three raw scores but "
+                    "does not declare which index corresponds to live."
+                )
+                return LivenessResult(
+                    is_live=False,
+                    live_score=None,
+                    scores=scores,
+                    probabilities=probabilities,
+                    details=details,
+                )
+
+            if self.threshold is None:
+                details["fail_closed_reason"] = (
+                    "threshold is not configured. No production liveness threshold is available."
+                )
+                return LivenessResult(
+                    is_live=False,
+                    live_score=None,
+                    scores=scores,
+                    probabilities=probabilities,
+                    details=details,
+                )
+
+            if self.live_class_index < 0 or self.live_class_index >= len(scores):
+                details["fail_closed_reason"] = (
+                    "live_class_index is invalid for the 3-class output vector."
+                )
+                return LivenessResult(
+                    is_live=False,
+                    live_score=None,
+                    scores=scores,
+                    probabilities=probabilities,
+                    details=details,
+                )
+
+            live_score = float(scores[self.live_class_index])
+            details["decision_rule"] = f"score[{self.live_class_index}] >= threshold"
+            details["live_score_selected"] = live_score
+
+            is_live = bool(live_score >= self.threshold)
+            return LivenessResult(
+                is_live=is_live,
+                live_score=live_score,
+                scores=scores,
+                probabilities=probabilities,
+                details=details,
+            )
+        except Exception as exc:
+            details = {
+                "fail_closed_reason": f"liveness inference failed: {exc}",
+                "fatal_error": True,
+                "class_mapping_known": False,
+            }
+            return LivenessResult(
+                is_live=False,
+                live_score=None,
+                scores=[],
+                probabilities=None,
+                details=details,
+            )
+
+    def close(self) -> None:
+        if self.session is not None:
+            self.session = None
+
